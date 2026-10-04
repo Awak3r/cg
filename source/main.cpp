@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <climits>
+#include <cstdlib>
 
 #include <iostream>
 
@@ -26,6 +27,11 @@ GLFWwindow* glfw_window;
 int main() {
 	int status = EXIT_SUCCESS;
 
+#if defined(__linux__)
+	if (std::getenv("WSL_DISTRO_NAME") != nullptr) {
+		glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+	}
+#endif
 	if (!glfwInit()) {
 		std::cerr << "Failed to initialize GLFW\n";
 		return EXIT_FAILURE;
@@ -39,6 +45,9 @@ int main() {
 		status = EXIT_FAILURE;
 		goto err_null_window;
 	}
+
+	glfwShowWindow(glfw_window);
+	glfwFocusWindow(glfw_window);
 
 	glfwSetFramebufferSizeCallback(glfw_window, [](GLFWwindow*, int width, int height){
 		if (width == 0 || height == 0) {
