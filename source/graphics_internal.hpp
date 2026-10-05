@@ -10,6 +10,9 @@ struct GLFWwindow;
 
 namespace graphics::internal {
 
+// Fixed 4x MSAA; both the shared render pass and the object pipeline use it.
+constexpr VkSampleCountFlagBits msaa_samples = VK_SAMPLE_COUNT_4_BIT;
+
 struct Context {
 	VkPhysicalDevice physical_device;
 	VkDevice device;

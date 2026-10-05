@@ -1,3 +1,36 @@
+# Lab 1 Grade-3 Redesign Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-subagent-driven-development (recommended) or superpowers-executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Reduce lab1 to the grade-3 baseline (single parallelepiped, MVP, depth test, back-face culling) while fixing the winding bug so the box renders correctly and looks polished.
+
+**Architecture:** Rewrite `application.cpp` down to a single uniform buffer (model/view/proj), one descriptor set, one draw call, static camera; fix `frontFace` to `CCW`; simplify both shaders (single uniform block, material constant in fragment shader). `graphics_internal.*`, `main.cpp`, `CMakeLists.txt` stay as-is (MSAA 4x and WSL fixes are intentionally kept).
+
+**Tech Stack:** Vulkan, GLFW, ImGui, VMA, C++20, CMake presets, glslc.
+
+**Spec:** `docs/superpowers/specs/2026-10-05-lab1-grade3-redesign.md`
+
+**Build/verify commands (run from `/home/bogdanoff/study/university/cg/lab1`):**
+
+```bash
+cmake --preset debug && cmake --build build-debug --parallel
+cmake --preset release && cmake --build build-release --parallel
+./run-wsl.sh    # launches app from project root; validation output goes to console/log
+```
+
+This repo is NOT a git repo — there are no commit steps. Verification is compile + run + log inspection instead of tests.
+
+---
+
+### Task 1: Rewrite `source/application.cpp` to grade-3 baseline
+
+**Files:**
+- Modify (full rewrite): `source/application.cpp`
+- Unchanged: `source/application.hpp`, `source/graphics_internal.hpp`, `source/graphics_internal.cpp`, `source/main.cpp`
+
+- [ ] **Step 1: Replace the entire content of `source/application.cpp` with the code below**
+
+```cpp
 #include "application.hpp"
 
 #include <array>
@@ -16,14 +49,13 @@ constexpr float pi = 3.14159265f;
 
 struct Vec3 { float x, y, z; };
 struct Mat4 { float a[16]{}; }; // Column-major, like GLSL mat4.
-struct Vertex { Vec3 position; Vec3 normal; Vec3 color; };
+struct Vertex { Vec3 position; Vec3 normal; };
 
-// std140: mat4 = 64 bytes, vec4 = 16 bytes, both 16-byte aligned.
+// std140: each mat4 is 16-byte aligned, 64 bytes.
 struct alignas(16) GlobalUniforms {
     Mat4 model;
     Mat4 view;
     Mat4 proj;
-    float tint[4]; // vec4 keeps std140 alignment simple.
 };
 
 Mat4 identity() {
@@ -44,12 +76,6 @@ Mat4 multiply(const Mat4& x, const Mat4& y) {
 Mat4 translation(Vec3 p) {
     Mat4 m = identity();
     m.a[12] = p.x; m.a[13] = p.y; m.a[14] = p.z;
-    return m;
-}
-
-Mat4 scale(Vec3 s) {
-    Mat4 m = identity();
-    m.a[0] = s.x; m.a[5] = s.y; m.a[10] = s.z;
     return m;
 }
 
@@ -77,17 +103,6 @@ Mat4 perspective(float aspect) {
     return m;
 }
 
-Mat4 orthographic(float aspect) {
-    const float h = 3.0f, w = h * aspect;
-    const float near = 0.1f, far = 100.0f;
-    Mat4 m = identity();
-    m.a[0] = 1.0f / w;
-    m.a[5] = -1.0f / h;
-    m.a[10] = 1.0f / (near - far);
-    m.a[14] = near / (near - far);
-    return m;
-}
-
 // Parallelepiped with half extents hx, hy, hz centered at the origin.
 constexpr float hx = 1.0f, hy = 0.7f, hz = 0.5f;
 
@@ -111,20 +126,13 @@ constexpr Vec3 faceCorners[6][4] = {
     {{-hx, -hy, -hz}, { hx, -hy, -hz}, { hx, -hy,  hz}, {-hx, -hy,  hz}},
 };
 
-// Procedural vertex color: normalized local position, X->R, Y->G, Z->B.
-constexpr Vec3 vertexColor(Vec3 p) {
-    return {(p.x + hx) / (2.0f * hx), (p.y + hy) / (2.0f * hy), (p.z + hz) / (2.0f * hz)};
-}
-
 // Flat shading: every face carries its own outward normal, hence 24 vertices
 // instead of the 8 unique corners.
 constexpr std::array<Vertex, 24> makeVertices() {
     std::array<Vertex, 24> result{};
     for (int face = 0; face < 6; ++face)
-        for (int corner = 0; corner < 4; ++corner) {
-            const Vec3 p = faceCorners[face][corner];
-            result[face * 4 + corner] = {p, faceNormals[face], vertexColor(p)};
-        }
+        for (int corner = 0; corner < 4; ++corner)
+            result[face * 4 + corner] = {faceCorners[face][corner], faceNormals[face]};
     return result;
 }
 
@@ -152,8 +160,8 @@ VkPipeline pipeline = VK_NULL_HANDLE;
 VkBuffer vertex_buffer = VK_NULL_HANDLE, index_buffer = VK_NULL_HANDLE;
 VmaAllocation vertex_memory = VK_NULL_HANDLE, index_memory = VK_NULL_HANDLE;
 
-// One global uniform buffer: model/view/proj/tint. Persistently mapped;
-// render() only memcpy's, so there is no map/unmap per frame.
+// One global uniform buffer: model/view/proj. Persistently mapped; render()
+// only memcpy's, so there is no map/unmap per frame.
 VkBuffer uniform_buffer = VK_NULL_HANDLE;
 VmaAllocation uniform_memory = VK_NULL_HANDLE;
 GlobalUniforms* uniform_data = nullptr;
@@ -161,26 +169,6 @@ GlobalUniforms* uniform_data = nullptr;
 VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-
-// Object transform state, edited from the ImGui panel.
-struct ObjectState {
-    float position[3] = {0, 0, 0};
-    float angles[3] = {18, 25, 0};
-    float size[3] = {1, 1, 1};
-    float color[3] = {1.0f, 1.0f, 1.0f}; // Tint multiplied onto vertex color.
-};
-ObjectState state;
-
-bool use_perspective = true;
-bool playing = false;
-bool spin = false;
-float laps_per_second = 0.15f, orbit_radius = 1.2f, orbit_height = 0.0f;
-float phase = 0.0f; // Angle along the circular orbit, in radians.
-double previous_time = -1.0;
-
-Vec3 orbitPoint(float t) {
-    return {orbit_radius * std::cos(t), orbit_height * std::sin(t), orbit_radius * std::sin(t)};
-}
 
 bool makeBuffer(VkDeviceSize bytes, VkBufferUsageFlags usage, const void* data,
                 VkBuffer& buffer, VmaAllocation& allocation, void** mapped) {
@@ -255,12 +243,11 @@ bool createPipeline() {
     const VkVertexInputAttributeDescription attributes[] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
-        {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, color)},
     };
     const VkPipelineVertexInputStateCreateInfo vertex_input = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &binding,
-        .vertexAttributeDescriptionCount = 3, .pVertexAttributeDescriptions = attributes,
+        .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = attributes,
     };
     const VkPipelineInputAssemblyStateCreateInfo assembly = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -326,17 +313,6 @@ bool createPipeline() {
     return true;
 }
 
-void resetState() {
-    state.position[0] = state.position[1] = state.position[2] = 0.0f;
-    state.angles[0] = 18.0f; state.angles[1] = 25.0f; state.angles[2] = 0.0f;
-    state.size[0] = state.size[1] = state.size[2] = 1.0f;
-    state.color[0] = state.color[1] = state.color[2] = 1.0f;
-    use_perspective = true;
-    playing = false; spin = false;
-    laps_per_second = 0.15f; orbit_radius = 1.2f; orbit_height = 0.0f;
-    phase = 0.0f;
-}
-
 } // namespace
 
 bool initialize() {
@@ -359,8 +335,7 @@ bool initialize() {
 
     const VkDescriptorSetLayoutBinding binding = {
         .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
     };
     const VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -419,44 +394,19 @@ void shutdown() {
 }
 
 void update(double time) {
+    static double previous_time = -1.0;
     static double fps = 0.0;
     if (previous_time >= 0.0) {
         const double dt = time - previous_time;
         if (dt > 0.0) fps = fps <= 0.0 ? 1.0 / dt : fps * 0.9 + (1.0 / dt) * 0.1;
-        if (playing) {
-            // Clamp long stalls (e.g. a dragged WSL window) so there is no jump.
-            const double step = std::fmax(0.0, std::fmin(dt, 0.05));
-            phase = std::fmod(phase + static_cast<float>(step) * laps_per_second * 2.0f * pi,
-                              2.0f * pi);
-        }
     }
     previous_time = time;
 
-    ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
     ImGui::Begin("Lab 1 - Parallelepiped (variant 3)");
+    ImGui::Text("Vulkan + GLFW + ImGui");
+    ImGui::Text("2.0 x 1.4 x 1.0, flat shading");
     ImGui::Text("FPS: %.0f", fps);
-    ImGui::Separator();
-
-    const char* projections[] = {"Perspective", "Orthographic"};
-    int projection_index = use_perspective ? 0 : 1;
-    if (ImGui::Combo("Projection", &projection_index, projections, 2))
-        use_perspective = (projection_index == 0);
-
-    ImGui::DragFloat3("Position", state.position, 0.05f, -3.0f, 3.0f);
-    ImGui::DragFloat3("Rotation (degrees)", state.angles, 0.5f, -180.0f, 180.0f);
-    ImGui::DragFloat3("Scale", state.size, 0.01f, 0.1f, 2.0f);
-    ImGui::ColorEdit3("Tint", state.color);
-    ImGui::Separator();
-
-    ImGui::Text("Orbit animation");
-    ImGui::Checkbox("Play / pause motion", &playing);
-    ImGui::SliderFloat("Speed (laps/second)", &laps_per_second, 0.03f, 0.6f, "%.2f");
-    ImGui::SliderFloat("Radius", &orbit_radius, 0.0f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Height", &orbit_height, 0.0f, 1.0f, "%.2f");
-    ImGui::Checkbox("Also rotate along orbit", &spin);
-    if (ImGui::Button("Restart phase")) phase = 0.0f;
-    ImGui::SameLine();
-    if (ImGui::Button("Reset all")) resetState();
     ImGui::End();
 }
 
@@ -483,25 +433,12 @@ void render(const graphics::internal::FrameData& fd) {
 
     const float aspect = static_cast<float>(ctx.swapchain_extent.width) / ctx.swapchain_extent.height;
 
-    // Orbit is added on top of the manual position from the UI.
-    const Vec3 point = orbitPoint(phase);
-    const Vec3 position = {state.position[0] + point.x, state.position[1] + point.y,
-                           state.position[2] + point.z};
-    const Mat4 model = multiply(
-        translation(position),
-        multiply(rotation(state.angles[0],
-                          state.angles[1] + (spin ? phase * 180.0f / pi : 0.0f),
-                          state.angles[2]),
-                 scale({state.size[0], state.size[1], state.size[2]})));
+    const Mat4 model = rotation(18.0f, 25.0f, 0.0f);
     const Mat4 view = translation({0, 0, -5.0f});
-    const Mat4 projection = use_perspective ? perspective(aspect) : orthographic(aspect);
+    const Mat4 projection = perspective(aspect);
     std::memcpy(&uniform_data->model, &model, sizeof(Mat4));
     std::memcpy(&uniform_data->view, &view, sizeof(Mat4));
     std::memcpy(&uniform_data->proj, &projection, sizeof(Mat4));
-    uniform_data->tint[0] = state.color[0];
-    uniform_data->tint[1] = state.color[1];
-    uniform_data->tint[2] = state.color[2];
-    uniform_data->tint[3] = 1.0f;
     vmaFlushAllocation(ctx.allocator, uniform_memory, 0, sizeof(GlobalUniforms));
 
     const VkViewport viewport = {0, 0, static_cast<float>(ctx.swapchain_extent.width),
@@ -523,3 +460,219 @@ void render(const graphics::internal::FrameData& fd) {
 }
 
 } // namespace application
+```
+
+- [ ] **Step 2: Verify the file compiles later (covered by Task 4 build step). Quick grep sanity check now**
+
+Run: `grep -c "vkDestroy\|vmaDestroyBuffer" source/application.cpp`
+Expected: at least 5 destroy calls (pipeline, pipeline layout, descriptor pool, descriptor set layout, 3 vma buffers).
+
+---
+
+### Task 2: Rewrite `shaders/box.vert` — single uniform block
+
+**Files:**
+- Modify (full rewrite): `shaders/box.vert`
+
+- [ ] **Step 1: Replace the entire content of `shaders/box.vert` with:**
+
+```glsl
+#version 450
+layout(location = 0) in vec3 inPosition;
+layout(location = 1) in vec3 inNormal;
+layout(location = 0) out vec3 worldNormal;
+
+layout(set = 0, binding = 0) uniform GlobalUniforms {
+	mat4 model;
+	mat4 view;
+	mat4 proj;
+} g;
+
+void main() {
+	gl_Position = g.proj * g.view * g.model * vec4(inPosition, 1.0);
+	// Inverse-transpose so normals survive any model matrix.
+	worldNormal = mat3(transpose(inverse(g.model))) * inNormal;
+}
+```
+
+---
+
+### Task 3: Rewrite `shaders/box.frag` — material constant, no tint
+
+**Files:**
+- Modify (full rewrite): `shaders/box.frag`
+
+- [ ] **Step 1: Replace the entire content of `shaders/box.frag` with:**
+
+```glsl
+#version 450
+layout(location = 0) in vec3 worldNormal;
+layout(location = 0) out vec4 outColor;
+
+// Key light from above-right-front + soft fill from below-left, both fixed
+// in world space. Fill keeps the opposite faces readable instead of black.
+const vec3 keyLightDirection = normalize(vec3(0.3, 0.85, 0.45));
+const vec3 fillLightDirection = normalize(vec3(-0.45, -0.25, 0.35));
+const float keyIntensity = 0.8;
+const float fillIntensity = 0.35;
+const vec3 material = vec3(0.35, 0.55, 0.85);
+
+void main() {
+	// Lambert: hemisphere ambient (brighter for up-facing surfaces) + diffuse.
+	const vec3 normal = normalize(worldNormal);
+	const float hemi = 0.5 + 0.5 * normal.y;
+	const vec3 ambient = mix(vec3(0.16), vec3(0.30), hemi);
+	const float diffuse = keyIntensity * max(dot(normal, keyLightDirection), 0.0) +
+	                      fillIntensity * max(dot(normal, fillLightDirection), 0.0);
+	outColor = vec4(material * min(ambient + diffuse, vec3(1.0)), 1.0);
+}
+```
+
+---
+
+### Task 4: Rebuild both presets
+
+**Files:** none modified; build only.
+
+- [ ] **Step 1: Reconfigure + build debug**
+
+Run:
+```bash
+cmake --preset debug && cmake --build build-debug --parallel
+```
+Expected: build finishes, `shaders/box.vert.spv` and `shaders/box.frag.spv` regenerated, no compiler errors.
+
+- [ ] **Step 2: Reconfigure + build release**
+
+Run:
+```bash
+cmake --preset release && cmake --build build-release --parallel
+```
+Expected: build finishes with no errors.
+
+---
+
+### Task 5: Run and verify validation-clean
+
+**Files:** none modified; runtime verification.
+
+- [ ] **Step 1: Launch the app from project root, capture logs**
+
+Run:
+```bash
+pkill -f vulkan-starter-app 2>/dev/null; sleep 1
+(./build-release/vulkan-starter-app > /tmp/opencode/cg/run.log 2>&1 &)
+sleep 5
+pgrep -a vulkan-starter-app
+```
+Expected: process running; log file contains no "Validation" / "validation layer" error lines.
+
+- [ ] **Step 2: Check the log for validation errors**
+
+Run: `grep -iE "validation|error|VUID" /tmp/opencode/cg/run.log || echo CLEAN`
+Expected: `CLEAN` (no validation output).
+
+- [ ] **Step 3: Close the app cleanly and verify shutdown**
+
+Run:
+```bash
+pkill -INT -f vulkan-starter-app 2>/dev/null || pkill -f vulkan-starter-app
+sleep 2
+grep -iE "validation|error|VUID" /tmp/opencode/cg/run.log || echo CLEAN_SHUTDOWN
+```
+Expected: process exits; `CLEAN_SHUTDOWN` printed (no destroy-time validation errors).
+
+- [ ] **Step 4: Visual acceptance by the user**
+
+Ask the user to look at the window: the box should show exactly 3 faces (front, left, top) with distinct lighting, no interior visible, smooth edges (MSAA 4x). CLI screenshots come out black in WSLg, so the user confirms visually.
+
+---
+
+### Task 6: Rewrite `README.md` for the grade-3 scope
+
+**Files:**
+- Modify (full rewrite): `README.md`
+
+- [ ] **Step 1: Replace the entire content of `README.md` with:**
+
+```markdown
+# Лабораторная работа 1 — Параллелепипед (вариант 3)
+
+Vulkan + GLFW + ImGui, C++20. Реализация на базе стартового репозитория
+[vkadeemerr/vulkan-starter-app](https://github.com/vkadeemerr/vulkan-starter-app).
+
+## Вариант
+
+**Вариант 3: параллелепипед** — прямоугольный параллелепипед 2.0 x 1.4 x 1.0
+(8 вершин углов, 24 вершины с нормалями граней, 12 треугольников, 36 индексов),
+центр в начале координат.
+
+## Сборка
+
+Нужны: компилятор C++20, CMake 3.20+, Vulkan SDK (`glslc` в PATH).
+
+```bash
+cmake --preset debug          # Linux (GCC/Clang)
+cmake --build build-debug --parallel
+```
+
+Windows: `cmake --preset msvc-debug` (Visual Studio) или `cmake --preset mingw-debug` (MinGW),
+затем `cmake --build build-debug --parallel`.
+
+## Запуск
+
+Рабочая директория — корень проекта (пути к шейдерам относительные):
+
+```bash
+./build-debug/vulkan-starter-app
+```
+
+Под WSL: `./run-wsl.sh` (ждёт готовности WSLg и запускает приложение).
+
+## Что реализовано (базовый уровень)
+
+- Окно GLFW, инициализация Vulkan, graphics pipeline.
+- Параллелепипед: vertex buffer + index buffer (VMA), рисование `vkCmdDrawIndexed`.
+- MVP-матрицы: model/view/projection через uniform buffer (`std140`, 192 байта).
+- Перспективная проекция (45°), вид подобран так, что видны три грани.
+- Depth test (`VK_COMPARE_OP_LESS`, clear depth = 1.0) — внутренность не видна.
+- Back-face culling (`VK_CULL_MODE_BACK_BIT`, лицевые — CCW-наружу грани).
+- Dynamic viewport/scissor (корректный resize окна).
+- Flat-освещение граней в фрагментном шейдере (нормали — outward нормаль грани).
+- MSAA 4x — сглаженные рёбра.
+- ImGui-окно с информацией о лабораторной (интеграция UI-библиотеки).
+- Все `vkCreate*` имеют парные `vkDestroy*` / `vmaDestroyBuffer`,
+  validation layers чистые.
+
+## Шейдеры
+
+`shaders/box.vert`, `shaders/box.frag` — компилируются через `glslc` на этапе сборки
+(CMake target `shaders`).
+
+## Управление
+
+Окно закрывается крестиком. ImGui-панель информационная (название, вариант, FPS).
+```
+
+- [ ] **Step 2: Final full rebuild to confirm nothing broke**
+
+Run: `cmake --build build-debug --parallel && cmake --build build-release --parallel`
+Expected: up-to-date / builds clean.
+
+---
+
+## Self-Review Results
+
+1. **Spec coverage:**
+   - §2 winding fix → Task 1 (`frontFace = COUNTER_CLOCKWISE`, comment updated).
+   - §3 deletions → Task 1 rewrite (all 4/5-level code gone; only GlobalUniforms + 1 set remain).
+   - §4.1–4.5 math/geometry/uniform/descriptors/scene → Task 1 (view -5, rotation 18/25, perspective 45).
+   - §4.6 pipeline (single change frontFace) → Task 1.
+   - §4.7 ImGui info window + FPS → Task 1 `update()`.
+   - §4.8 render() → Task 1.
+   - §5 shaders → Tasks 2, 3.
+   - §6 README → Task 6.
+   - §8 verification → Tasks 4, 5.
+   - §3 "keep" list (MSAA, WSL, glslc changes) → no task touches those files, as required.
+2. **Placeholder scan:** none — every step has complete code or exact commands.
+3. **Type consistency:** `GlobalUniforms` (model/view/proj) matches in Task 1 C++ and Task 2 GLSL; `set = 0, binding = 0` matches layout binding 0; descriptor uses `sizeof(GlobalUniforms)`; `msaa_samples` referenced exactly as declared in `graphics_internal.hpp`; `application.hpp` API (initialize/shutdown/update/render) unchanged.

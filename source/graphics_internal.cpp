@@ -43,6 +43,12 @@ VkImage vk_image_depth_buffer;
 VmaAllocation vma_allocation_depth_buffer;
 VkImageView vk_image_view_depth_buffer;
 
+// Offscreen multisampled color attachment that the render pass resolves
+// into the swapchain image (the resolve attachment).
+VkImage vk_image_msaa_color;
+VmaAllocation vma_allocation_msaa_color;
+VkImageView vk_image_view_msaa_color;
+
 std::vector<VkFramebuffer> vk_framebuffers;
 
 VkSemaphore vk_semaphore_image_available;
@@ -282,6 +288,9 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 	vkDestroyImageView(context.device, vk_image_view_depth_buffer, nullptr);
 	vmaDestroyImage(context.allocator, vk_image_depth_buffer, vma_allocation_depth_buffer);
 
+	vkDestroyImageView(context.device, vk_image_view_msaa_color, nullptr);
+	vmaDestroyImage(context.allocator, vk_image_msaa_color, vma_allocation_msaa_color);
+
 	const VkImageCreateInfo depth_buffer = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.imageType = VK_IMAGE_TYPE_2D,
@@ -289,7 +298,7 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 		.extent = { context.swapchain_extent.width, context.swapchain_extent.height, 1 },
 		.mipLevels = 1,
 		.arrayLayers = 1,
-		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.samples = msaa_samples,
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
 		.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -327,11 +336,59 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 		return false;
 	}
 
+	const VkImageCreateInfo msaa_color = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = context.swapchain_format,
+		.extent = { context.swapchain_extent.width, context.swapchain_extent.height, 1 },
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = msaa_samples,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+		         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	const VmaAllocationCreateInfo msaa_color_allocation = {
+		.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+		.usage = VMA_MEMORY_USAGE_AUTO,
+	};
+
+	if (vmaCreateImage(context.allocator, &msaa_color, &msaa_color_allocation,
+					   &vk_image_msaa_color, &vma_allocation_msaa_color,
+					   nullptr) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate and create Vulkan image for MSAA color buffer\n";
+		return false;
+	}
+
+	const VkImageViewCreateInfo msaa_color_view = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = vk_image_msaa_color,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = context.swapchain_format,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+
+	if (vkCreateImageView(context.device, &msaa_color_view, nullptr,
+						  &vk_image_view_msaa_color) != VK_SUCCESS) {
+		std::cerr << "Failed to create Vulkan image view for MSAA color buffer\n";
+		return false;
+	}
+
 	const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
 	VkImageView framebuffer_attachments[] = {
-		VK_NULL_HANDLE,
+		vk_image_view_msaa_color,
 		vk_image_view_depth_buffer,
+		VK_NULL_HANDLE,
 	};
 
 	const VkFramebufferCreateInfo framebuffer = {
@@ -347,7 +404,7 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 	vk_framebuffers.resize(swapchain_images_count);
 
 	for (uint32_t i = 0; i < swapchain_images_count; ++i) {
-		framebuffer_attachments[0] = vk_swapchain_image_views[i];
+		framebuffer_attachments[2] = vk_swapchain_image_views[i];
 
 		if (vkCreateFramebuffer(context.device, &framebuffer, nullptr,
 								&vk_framebuffers[i]) != VK_SUCCESS) {
@@ -490,7 +547,7 @@ bool initialize(GLFWwindow* const window) {
 		.extent = { context.swapchain_extent.width, context.swapchain_extent.height, 1 },
 		.mipLevels = 1,
 		.arrayLayers = 1,
-		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.samples = msaa_samples,
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
 		.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -528,12 +585,61 @@ bool initialize(GLFWwindow* const window) {
 		return false;
 	}
 
+	const VkImageCreateInfo msaa_color = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = context.swapchain_format,
+		.extent = { context.swapchain_extent.width, context.swapchain_extent.height, 1 },
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = msaa_samples,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+		         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	const VmaAllocationCreateInfo msaa_color_allocation = {
+		.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+		.usage = VMA_MEMORY_USAGE_AUTO,
+	};
+
+	if (vmaCreateImage(context.allocator, &msaa_color, &msaa_color_allocation,
+					   &vk_image_msaa_color, &vma_allocation_msaa_color,
+					   nullptr) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate and create Vulkan image for MSAA color buffer\n";
+		return false;
+	}
+
+	const VkImageViewCreateInfo msaa_color_view = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = vk_image_msaa_color,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = context.swapchain_format,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+
+	if (vkCreateImageView(context.device, &msaa_color_view, nullptr,
+						  &vk_image_view_msaa_color) != VK_SUCCESS) {
+		std::cerr << "Failed to create Vulkan image view for MSAA color buffer\n";
+		return false;
+	}
+
 	const VkAttachmentDescription render_pass_attachments[] = {
 		{
+			// Multisampled color attachment rendered by the object pipeline.
 			.format = context.swapchain_format,
-			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.samples = msaa_samples,
 			.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			// Resolved into attachment 2, keeping the samples is pointless.
+			.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -541,13 +647,24 @@ bool initialize(GLFWwindow* const window) {
 		},
 		{
 			.format = vk_depth_buffer_format,
-			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.samples = msaa_samples,
 			.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 			.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		},
+		{
+			// The swapchain image acts as the MSAA resolve target.
+			.format = context.swapchain_format,
+			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		},
 	};
 
@@ -561,10 +678,16 @@ bool initialize(GLFWwindow* const window) {
 		.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 	};
 
+	const VkAttachmentReference render_pass_resolve_attachment = {
+		.attachment = 2,
+		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+
 	const VkSubpassDescription render_pass_subpass = {
 		.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
 		.colorAttachmentCount = 1,
 		.pColorAttachments = &render_pass_color_attachment,
+		.pResolveAttachments = &render_pass_resolve_attachment,
 		.pDepthStencilAttachment = &render_pass_depth_attachment,
 	};
 
@@ -582,8 +705,9 @@ bool initialize(GLFWwindow* const window) {
 	}
 
 	VkImageView framebuffer_attachments[] = {
+		vk_image_view_msaa_color,
+		vk_image_view_depth_buffer,
 		VK_NULL_HANDLE,
-		vk_image_view_depth_buffer
 	};
 
 	const VkFramebufferCreateInfo framebuffer = {
@@ -599,7 +723,7 @@ bool initialize(GLFWwindow* const window) {
 	vk_framebuffers.resize(swapchain_images_count);
 
 	for (uint32_t i = 0; i < swapchain_images_count; ++i) {
-		framebuffer_attachments[0] = vk_swapchain_image_views[i];
+		framebuffer_attachments[2] = vk_swapchain_image_views[i];
 
 		if (vkCreateFramebuffer(context.device, &framebuffer, nullptr,
 								&vk_framebuffers[i]) != VK_SUCCESS) {
@@ -694,6 +818,9 @@ void shutdown() {
 
 	vkDestroyImageView(context.device, vk_image_view_depth_buffer, nullptr);
 	vmaDestroyImage(context.allocator, vk_image_depth_buffer, vma_allocation_depth_buffer);
+
+	vkDestroyImageView(context.device, vk_image_view_msaa_color, nullptr);
+	vmaDestroyImage(context.allocator, vk_image_msaa_color, vma_allocation_msaa_color);
 
 	for (size_t i = 0, n = vk_swapchain_images.size(); i < n; ++i) {
 		vkDestroyImageView(context.device, vk_swapchain_image_views[i], nullptr);
