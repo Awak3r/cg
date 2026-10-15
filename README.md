@@ -1,78 +1,66 @@
-# Лабораторная работа 1 — Параллелепипед (вариант 3)
+# 🌋 Vulkan Starter App
 
-Vulkan + GLFW + ImGui, C++20. Реализация на базе стартового репозитория
-[vkadeemerr/vulkan-starter-app](https://github.com/vkadeemerr/vulkan-starter-app).
+## Getting started
 
-## Вариант
+You need C++ compiler, Vulkan SDK and CMake installed before you can build this project.
 
-**Вариант 3: параллелепипед** — прямоугольный параллелепипед 2.0 x 1.4 x 1.0
-(8 вершин углов, 24 вершины с нормалями и цветами граней, 12 треугольников,
-36 индексов), центр в начале координат.
+This project uses C++20 standard and thus requires either of those compilers:
+- GCC 10.X
+- Clang 10
+- Microsoft Visual Studio 2019
 
-## Сборка
+This is officially tested on *Windows* and *GNU/Linux platforms*, no *macOS* support yet.
+If you have a working macOS solution of this code, consider submitting a PR so others
+can build this example code without a hassle!
 
-Нужны: компилятор C++20, CMake 3.20+, Vulkan SDK (`glslc` в PATH).
+<ins>**1. Downloading the repository**</ins>
 
-```bash
-cmake --preset debug          # Linux (GCC/Clang)
-cmake --build build-debug --parallel
-```
+Start by cloning the repository with `git clone --depth 1 https://github.com/vladeemerr/vulkan-starter-app`
 
-Windows: `cmake --preset msvc-debug` (Visual Studio) или `cmake --preset mingw-debug` (MinGW),
-затем `cmake --build build-debug --parallel`.
+This repository does not contain any submodules, it utilizes CMake's `FetchContent` feature instead.
 
-## Запуск
+<ins>**2. Configuring the project**</ins>
 
-Рабочая директория — корень проекта (пути к шейдерам относительные):
+Run either one of the CMake lines to download dependencies and configure the project:
 
 ```bash
-./build-debug/vulkan-starter-app
+cmake --preset debug       # for GNU/Linux (GCC/Clang)
+cmake --preset msvc-debug  # for Windows (Visual Studio 2019)
+cmake --preset mingw-debug # for Windows (MinGW)
 ```
 
-Под WSL: `./run-wsl.sh` (ждёт готовности WSLg и запускает приложение).
+If you wish to build in `release` mode, change `debug` to `release`.
 
-## Что реализовано
+If changes are made (added/removed files), or if you want to regenerate project files, rerun the command above.
 
-### Базовый уровень (оценка 3)
+<ins>**3. Building**</ins>
 
-- [x] Окно GLFW, инициализация Vulkan, graphics pipeline.
-- [x] Параллелепипед: vertex buffer + index buffer (VMA), рисование `vkCmdDrawIndexed`.
-- [x] MVP-матрицы: model/view/projection через uniform buffer (`std140`, 208 байт).
-- [x] Depth test (`VK_COMPARE_OP_LESS`, clear depth = 1.0) — внутренность не видна.
-- [x] Back-face culling (`VK_CULL_MODE_BACK_BIT`, лицевые — CCW-наружу грани).
-- [x] Dynamic viewport/scissor (корректный resize окна).
-- [x] Flat-освещение граней в фрагментном шейдере (нормали — outward нормаль грани).
-- [x] MSAA 4x — сглаженные рёбра.
-- [x] Все `vkCreate*` имеют парные `vkDestroy*` / `vmaDestroyBuffer`,
-  validation layers чистые.
+To build the project, use the line below. You are most likely using `debug` preset, so
+the directory that will eventually contain your build files is named `build-debug`.
 
-### Дополнительные задания (оценка 4)
+Likewise for `release` that directory will be named `build-release`
 
-- [x] **Доп. 1** — переключение перспективной/ортографической проекции (ImGui Combo).
-- [x] **Доп. 2** — position / rotation / scale (DragFloat3), модель = T·Rz·Ry·Rx·S.
-- [x] **Доп. 3** — анимация по круговой орбите: play/pause, скорость (оборотов/сек),
-      радиус, высота орбиты, опциональное вращение бокса вдоль орбиты,
-      перезапуск фазы, clamp длинных пауз.
-- [x] **Доп. 4** — `ImGui::ColorEdit3`, tint умножается на цвет вершины во фрагментном шейдере.
-- [x] **Доп. 5** — процедурные цвета вершин: нормированная локальная позиция
-      `(pos + halfExtent) / (2 * halfExtent)`, т.е. X→R, Y→G, Z→B.
+Run one those commands, depending on which preset you chose:
 
-### Шейдеры
+```bash
+cmake --build build-debug --parallel # for debug
+cmake --build build-release --parallel # for release
+```
 
-`shaders/box.vert`, `shaders/box.frag` — компилируются через `glslc` на этапе сборки
-(CMake target `shaders`).
+### Running
 
-Финальный цвет фрагмента: `vertexColor * tint * lighting`
-(освещение — Lambert: hemisphere ambient + key/fill источники).
+`build-*` directory will contain the executable in one of the subdirectories after successful build.
 
-## Управление
+For `msvc-{debug|release}` builds output subdirectory is set to `Debug` or `Release` respectively.
+For other configurations output subdirectory is set to `vulkan-starter-app`.
 
-| Элемент | Назначение |
-|---|---|
-| Projection | Perspective / Orthographic |
-| Position, Rotation, Scale | трансформации бокса |
-| Tint | цвет, умножаемый на процедурный цвет вершины |
-| Play / pause motion | запуск/пауза орбитальной анимации |
-| Speed, Radius, Height | параметры орбиты |
-| Also rotate along orbit | дополнительное вращение бокса вдоль орбиты |
-| Restart phase / Reset all | сброс фазы / полный сброс состояния |
+**Make sure your working directory is set to the project root!**
+Project root is where this README file resides. Otherwise, the
+code responsible for loading shaders or other resources from files will fail,
+because relative paths are used.
+
+### Compiling shaders
+
+`CMakeLists.txt` has a build recipe for compiling shader files
+along with an application. Look for a comment in this file to see
+how to compile your shaders.
