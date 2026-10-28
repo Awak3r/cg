@@ -174,12 +174,12 @@ ObjectState state;
 bool use_perspective = true;
 bool playing = false;
 bool spin = false;
-float laps_per_second = 0.15f, orbit_radius = 1.2f, orbit_height = 0.0f;
+float laps_per_second = 0.15f, orbit_radius = 1.2f;
 float phase = 0.0f; // Angle along the circular orbit, in radians.
 double previous_time = -1.0;
 
 Vec3 orbitPoint(float t) {
-    return {orbit_radius * std::cos(t), orbit_height * std::sin(t), orbit_radius * std::sin(t)};
+    return {orbit_radius * std::cos(t), 0.0f, orbit_radius * std::sin(t)};
 }
 
 bool makeBuffer(VkDeviceSize bytes, VkBufferUsageFlags usage, const void* data,
@@ -333,7 +333,7 @@ void resetState() {
     state.color[0] = state.color[1] = state.color[2] = 1.0f;
     use_perspective = true;
     playing = false; spin = false;
-    laps_per_second = 0.15f; orbit_radius = 1.2f; orbit_height = 0.0f;
+    laps_per_second = 0.15f; orbit_radius = 1.2f;
     phase = 0.0f;
 }
 
@@ -452,7 +452,7 @@ void update(double time) {
     ImGui::Checkbox("Play / pause motion", &playing);
     ImGui::SliderFloat("Speed (laps/second)", &laps_per_second, 0.03f, 0.6f, "%.2f");
     ImGui::SliderFloat("Radius", &orbit_radius, 0.0f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Height", &orbit_height, 0.0f, 1.0f, "%.2f");
+
     ImGui::Checkbox("Also rotate along orbit", &spin);
     if (ImGui::Button("Restart phase")) phase = 0.0f;
     ImGui::SameLine();
