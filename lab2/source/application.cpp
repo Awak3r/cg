@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
-#include <cstdio>
 #include <iostream>
 #include <vector>
 
@@ -15,16 +14,11 @@ namespace {
 
 constexpr float pi = 3.14159265f;
 
-// Максимальное число источников в storage-буферах (лимит — не в шейдере,
-// поэтому массивы в GLSL остаются динамической длины).
-constexpr size_t max_lights = 256;
-
 struct Vec3 { float x, y, z; };
 struct Mat4 { float a[16]{}; }; // Column-major, like GLSL mat4.
 struct Vertex { Vec3 position; Vec3 normal; Vec3 color; };
 
 // std140-зеркало блока SceneUniforms из object.vert/object.frag.
-// Только mat4 и vec4 — выравнивание совпадает с std430 в storage-буферах.
 struct alignas(16) SceneUniforms {
 	Mat4 view;                       // 64
 	Mat4 proj;                       // 64
@@ -32,7 +26,7 @@ struct alignas(16) SceneUniforms {
 	float ambientLight[4];           // 16: rgb, a — запас
 	float dirLightDirection[4];      // 16: xyz — направление (normalized)
 	float dirLightColorIntensity[4]; // 16: rgb, a — интенсивность
-	float lightCounts[4];            // 16: x — точечные, y — прожекторные, z — exposure
+	float display[4];                // 16: x — экспозиция тонемаппинга
 };                                   // итого 208 байт
 
 // std140-зеркало блока ModelUniforms.
@@ -40,24 +34,7 @@ struct alignas(16) ModelUniforms {
 	Mat4 model;                   // 64
 	float albedoColor[4];         // 16: rgb, w — запас
 	float specularShininess[4];   // 16: rgb — цвет блика, w — коэффициент блеска
-	float flags[4];               // 16: x — шахматный пол (отключён), yzw — запас
-};                                // итого 128 байт
-
-// std430-зеркало struct PointLight из object.frag.
-struct alignas(16) GpuPointLight {
-	float position[4];            // xyz, w — запас
-	float colorIntensity[4];      // rgb, a — интенсивность
-};
-static_assert(sizeof(GpuPointLight) == 32, "std430 mirror broken");
-
-// std430-зеркало struct SpotLight из object.frag.
-struct alignas(16) GpuSpotLight {
-	float position[4];            // xyz, w — запас
-	float direction[4];           // xyz — ось конуса (normalized)
-	float colorIntensity[4];      // rgb, a — интенсивность
-	float angles[4];              // x — cos(inner), y — cos(outer)
-};
-static_assert(sizeof(GpuSpotLight) == 64, "std430 mirror broken");
+};                                // итого 96 байт
 
 Mat4 identity() {
 	Mat4 m{};
@@ -205,31 +182,19 @@ VkPipeline pipeline = VK_NULL_HANDLE;
 VkBuffer vertex_buffer = VK_NULL_HANDLE, index_buffer = VK_NULL_HANDLE;
 VmaAllocation vertex_memory = VK_NULL_HANDLE, index_memory = VK_NULL_HANDLE;
 
-// set = 0: UBO сцены + два storage-буфера для источников света.
+// Единый набор дескрипторов (базовое задание — без разделения по наборам):
+// binding 0 — UBO сцены (матрицы, освещение), binding 1 — UBO модели (материал).
 VkBuffer scene_ubo = VK_NULL_HANDLE;
 VmaAllocation scene_ubo_memory = VK_NULL_HANDLE;
 SceneUniforms* scene_ubo_data = nullptr;
 
-// Storage-буферы светов: persistently mapped, каждый кадр переписываются
-// (первые count элементов), дескрипторы не пересоздаются.
-VkBuffer point_lights_ssbo = VK_NULL_HANDLE;
-VmaAllocation point_lights_memory = VK_NULL_HANDLE;
-GpuPointLight* point_lights_data = nullptr;
-
-VkBuffer spot_lights_ssbo = VK_NULL_HANDLE;
-VmaAllocation spot_lights_memory = VK_NULL_HANDLE;
-GpuSpotLight* spot_lights_data = nullptr;
-
-// set = 1: UBO модели.
 VkBuffer model_ubo = VK_NULL_HANDLE;
 VmaAllocation model_ubo_memory = VK_NULL_HANDLE;
 ModelUniforms* model_ubo_data = nullptr;
 
-VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;
-VkDescriptorSetLayout model_set_layout = VK_NULL_HANDLE;
+VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-VkDescriptorSet scene_set = VK_NULL_HANDLE;
-VkDescriptorSet model_set = VK_NULL_HANDLE;
+VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 
 // ---- Состояние, правится из ImGui -------------------------------------
 
@@ -247,23 +212,6 @@ struct DirectionalLightState {
 	float intensity = 0.50f;
 };
 DirectionalLightState dirLight;
-
-struct PointLightState {
-	float position[3] = {1.8f, 0.9f, 1.2f};
-	float color[3] = {1.0f, 0.6f, 0.3f};
-	float intensity = 5.0f;
-};
-std::vector<PointLightState> pointLights;
-
-struct SpotLightState {
-	float position[3] = {0.4f, 2.4f, 0.6f};
-	float direction[3] = {0.0f, -1.0f, -0.1f};
-	float color[3] = {1.0f, 0.95f, 0.85f};
-	float intensity = 6.0f;
-	float innerAngleDegrees = 10.0f;
-	float outerAngleDegrees = 24.0f;
-};
-std::vector<SpotLightState> spotLights;
 
 struct ObjectState {
 	float position[3] = {0, 0, 0};
@@ -339,11 +287,11 @@ bool createPipeline() {
 	VkShaderModule frag = shaderModule("shaders/object.frag.spv");
 	if (!vert || !frag) return false;
 
-	// Два набора: индекс 0 — сцена (set = 0 в шейдерах), 1 — модель (set = 1).
-	const VkDescriptorSetLayout set_layouts[] = {scene_set_layout, model_set_layout};
+	// Единый набор дескрипторов: индекс 0 (set = 0 в шейдерах),
+	// внутри него binding 0 — сцена, binding 1 — модель.
 	const VkPipelineLayoutCreateInfo layout_info = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 2, .pSetLayouts = set_layouts,
+		.setLayoutCount = 1, .pSetLayouts = &set_layout,
 	};
 	if (vkCreatePipelineLayout(ctx.device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS)
 		return false;
@@ -429,78 +377,55 @@ bool createPipeline() {
 	return true;
 }
 
-// Пул дескрипторов: должен вмещать и UBO, и STORAGE дескрипторы обоих наборов.
+// Пул дескрипторов: два uniform-дескриптора в одном наборе.
 bool createDescriptors() {
 	auto& ctx = graphics::internal::context;
 
-	// set = 0: UBO сцены + два storage-буфера светов (только фрагментный шейдер).
-	const VkDescriptorSetLayoutBinding scene_bindings[] = {
+	// binding 0 — UBO сцены, binding 1 — UBO модели (оба в вершинном и
+	// фрагментном шейдерах).
+	const VkDescriptorSetLayoutBinding bindings[] = {
 		{
 			.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		{
-			.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-			.descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-		},
-		{
-			.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-			.descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
-	const VkDescriptorSetLayoutCreateInfo scene_layout_info = {
+	const VkDescriptorSetLayoutCreateInfo layout_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 3, .pBindings = scene_bindings,
+		.bindingCount = 2, .pBindings = bindings,
 	};
-	if (vkCreateDescriptorSetLayout(ctx.device, &scene_layout_info, nullptr,
-	                                &scene_set_layout) != VK_SUCCESS) {
-		std::cerr << "Cannot create scene descriptor set layout\n";
-		return false;
-	}
-
-	// set = 1: UBO модели.
-	const VkDescriptorSetLayoutBinding model_binding = {
-		.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-	};
-	const VkDescriptorSetLayoutCreateInfo model_layout_info = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1, .pBindings = &model_binding,
-	};
-	if (vkCreateDescriptorSetLayout(ctx.device, &model_layout_info, nullptr,
-	                                &model_set_layout) != VK_SUCCESS) {
-		std::cerr << "Cannot create model descriptor set layout\n";
+	if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr,
+	                                &set_layout) != VK_SUCCESS) {
+		std::cerr << "Cannot create descriptor set layout\n";
 		return false;
 	}
 
 	const VkDescriptorPoolSize pool_sizes[] = {
 		{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 2},
-		{.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2},
 	};
 	const VkDescriptorPoolCreateInfo pool_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 2, .poolSizeCount = 2, .pPoolSizes = pool_sizes,
+		.maxSets = 1, .poolSizeCount = 1, .pPoolSizes = pool_sizes,
 	};
 	if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
 		std::cerr << "Cannot create descriptor pool\n";
 		return false;
 	}
 
-	VkDescriptorSetLayout set_layouts[] = {scene_set_layout, model_set_layout};
 	const VkDescriptorSetAllocateInfo set_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
 		.descriptorPool = descriptor_pool,
-		.descriptorSetCount = 2, .pSetLayouts = set_layouts,
+		.descriptorSetCount = 1, .pSetLayouts = &set_layout,
 	};
-	VkDescriptorSet sets[2] = {};
-	if (vkAllocateDescriptorSets(ctx.device, &set_info, sets) != VK_SUCCESS) {
-		std::cerr << "Cannot allocate descriptor sets\n";
+	if (vkAllocateDescriptorSets(ctx.device, &set_info, &descriptor_set) != VK_SUCCESS) {
+		std::cerr << "Cannot allocate descriptor set\n";
 		return false;
 	}
-	scene_set = sets[0];
-	model_set = sets[1];
 	return true;
 }
 
@@ -523,13 +448,6 @@ void resetState() {
 	material = MaterialState();
 	ambientIntensity = 0.03f;
 	exposure = 0.90f;
-	// Стартовый набор источников тот же, что и в initialize().
-	pointLights.clear();
-	pointLights.push_back({{2.8f, 0.8f, 2.6f}, {1.0f, 0.50f, 0.28f}, 3.5f});
-	pointLights.push_back({{-2.8f, 0.5f, 2.2f}, {0.35f, 0.55f, 1.0f}, 2.5f});
-	spotLights.clear();
-	spotLights.push_back({{0.2f, 2.6f, 1.6f}, {0.0f, -1.0f, -0.55f},
-	                      {1.0f, 0.97f, 0.92f}, 6.0f, 9.0f, 27.0f});
 }
 
 } // namespace
@@ -550,22 +468,6 @@ bool initialize() {
 		return false;
 	}
 
-	if (!makeBuffer(VkDeviceSize(max_lights * sizeof(GpuPointLight)),
-	                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr,
-	                point_lights_ssbo, point_lights_memory,
-	                reinterpret_cast<void**>(&point_lights_data))) {
-		std::cerr << "Cannot create point lights storage buffer\n";
-		return false;
-	}
-
-	if (!makeBuffer(VkDeviceSize(max_lights * sizeof(GpuSpotLight)),
-	                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr,
-	                spot_lights_ssbo, spot_lights_memory,
-	                reinterpret_cast<void**>(&spot_lights_data))) {
-		std::cerr << "Cannot create spot lights storage buffer\n";
-		return false;
-	}
-
 	if (!makeBuffer(sizeof(ModelUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr,
 	                model_ubo, model_ubo_memory,
 	                reinterpret_cast<void**>(&model_ubo_data))) {
@@ -575,25 +477,11 @@ bool initialize() {
 
 	if (!createDescriptors()) return false;
 
-	// Привязка буферов к наборам дескрипторов: единожды, буферы не меняются.
-	writeDescriptorSet(scene_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+	// Привязка буферов к дескрипторам: единожды, буферы не меняются.
+	writeDescriptorSet(descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 	                   scene_ubo, sizeof(SceneUniforms));
-	writeDescriptorSet(scene_set, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-	                   point_lights_ssbo, max_lights * sizeof(GpuPointLight));
-	writeDescriptorSet(scene_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-	                   spot_lights_ssbo, max_lights * sizeof(GpuSpotLight));
-	writeDescriptorSet(model_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+	writeDescriptorSet(descriptor_set, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 	                   model_ubo, sizeof(ModelUniforms));
-
-	// Стартовая сцена: холодный ключевой направленный сверху-слева; тёплый point
-	// справа-спереди и холодный слева-спереди расщепляют видимые грани по цвету
-	// (тёплые/холодные переливы, как в термосъёмке тора); спот сверху-спереди
-	// даёт блестящую «корону» на верхней грани. Интенсивности небольшие:
-	// затухание 1/D² и гамма легко вымывают цвет в пастель.
-	pointLights.push_back({{2.8f, 0.8f, 2.6f}, {1.0f, 0.50f, 0.28f}, 3.5f});
-	pointLights.push_back({{-2.8f, 0.5f, 2.2f}, {0.35f, 0.55f, 1.0f}, 2.5f});
-	spotLights.push_back({{0.2f, 2.6f, 1.6f}, {0.0f, -1.0f, -0.55f},
-	                      {1.0f, 0.97f, 0.92f}, 6.0f, 9.0f, 27.0f});
 
 	if (!createPipeline()) return false;
 	return true;
@@ -605,15 +493,10 @@ void shutdown() {
 	vkDestroyPipeline(ctx.device, pipeline, nullptr);
 	vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
 	vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
-	vkDestroyDescriptorSetLayout(ctx.device, scene_set_layout, nullptr);
-	vkDestroyDescriptorSetLayout(ctx.device, model_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(ctx.device, set_layout, nullptr);
 	if (vertex_buffer) vmaDestroyBuffer(ctx.allocator, vertex_buffer, vertex_memory);
 	if (index_buffer) vmaDestroyBuffer(ctx.allocator, index_buffer, index_memory);
 	if (scene_ubo) vmaDestroyBuffer(ctx.allocator, scene_ubo, scene_ubo_memory);
-	if (point_lights_ssbo)
-		vmaDestroyBuffer(ctx.allocator, point_lights_ssbo, point_lights_memory);
-	if (spot_lights_ssbo)
-		vmaDestroyBuffer(ctx.allocator, spot_lights_ssbo, spot_lights_memory);
 	if (model_ubo) vmaDestroyBuffer(ctx.allocator, model_ubo, model_ubo_memory);
 }
 
@@ -644,61 +527,14 @@ void update(double time) {
 		ImGui::Spacing();
 	}
 
-	// Освещение: позиция, цвет + интенсивность и уникальные параметры
-	// каждого типа источника (ТЗ), плюс добавление/удаление из UI (доп. 2-3).
+	// Освещение: единственный направленный источник + рассеянный свет —
+	// параметры изменяемые из ImGui (базовое задание).
 	if (ImGui::CollapsingHeader("Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::Text("Directional light:");
 		ImGui::DragFloat3("Direction", dirLight.direction, 0.01f, -1.0f, 1.0f);
 		ImGui::ColorEdit3("Color##dir", dirLight.color);
 		ImGui::SliderFloat("Intensity##dir", &dirLight.intensity, 0.0f, 5.0f);
 		ImGui::SliderFloat("Ambient intensity", &ambientIntensity, 0.0f, 1.0f);
 		ImGui::Spacing();
-
-		ImGui::SeparatorText("Point lights");
-		if (ImGui::Button("+ Add##point") && pointLights.size() < max_lights)
-			pointLights.push_back({});
-		ImGui::SameLine();
-		if (ImGui::Button("Clear##point")) pointLights.clear();
-		for (size_t i = 0; i < pointLights.size(); ++i) {
-			ImGui::PushID(static_cast<int>(i));
-			char header[32];
-			std::snprintf(header, sizeof header, "Point light #%zu", i);
-			if (ImGui::CollapsingHeader(header)) {
-				ImGui::DragFloat3("Position", pointLights[i].position, 0.05f, -10.0f, 10.0f);
-				ImGui::ColorEdit3("Color", pointLights[i].color);
-				ImGui::SliderFloat("Intensity", &pointLights[i].intensity, 0.0f, 30.0f);
-				if (ImGui::Button("Remove"))
-					pointLights.erase(pointLights.begin() + static_cast<long>(i));
-			}
-			ImGui::PopID();
-		}
-		ImGui::Spacing();
-
-		ImGui::SeparatorText("Spot lights");
-		if (ImGui::Button("+ Add##spot") && spotLights.size() < max_lights)
-			spotLights.push_back({});
-		ImGui::SameLine();
-		if (ImGui::Button("Clear##spot")) spotLights.clear();
-		for (size_t i = 0; i < spotLights.size(); ++i) {
-			ImGui::PushID(static_cast<int>(i + 1000));
-			char header[32];
-			std::snprintf(header, sizeof header, "Spot light #%zu", i);
-			if (ImGui::CollapsingHeader(header)) {
-				ImGui::DragFloat3("Position", spotLights[i].position, 0.05f, -10.0f, 10.0f);
-				ImGui::DragFloat3("Direction", spotLights[i].direction, 0.01f, -1.0f, 1.0f);
-				ImGui::ColorEdit3("Color", spotLights[i].color);
-				ImGui::SliderFloat("Intensity", &spotLights[i].intensity, 0.0f, 40.0f);
-				// Уникальные параметры прожектора: внутренний и внешний углы
-				// мягких краёв (ТЗ). Внешний не может быть меньше внутреннего.
-				ImGui::SliderFloat("Inner angle", &spotLights[i].innerAngleDegrees, 0.0f, 89.0f, "%.0f deg");
-				ImGui::SliderFloat("Outer angle", &spotLights[i].outerAngleDegrees, 0.0f, 89.0f, "%.0f deg");
-				if (spotLights[i].outerAngleDegrees < spotLights[i].innerAngleDegrees)
-					spotLights[i].outerAngleDegrees = spotLights[i].innerAngleDegrees;
-				if (ImGui::Button("Remove"))
-					spotLights.erase(spotLights.begin() + static_cast<long>(i));
-			}
-			ImGui::PopID();
-		}
 	}
 
 	// Материал: альбедо, цвет блика, коэффициент блика (ТЗ).
@@ -770,54 +606,11 @@ void render(const graphics::internal::FrameData& fd) {
 	scene_ubo_data->dirLightColorIntensity[1] = dirLight.color[1];
 	scene_ubo_data->dirLightColorIntensity[2] = dirLight.color[2];
 	scene_ubo_data->dirLightColorIntensity[3] = dirLight.intensity;
-	scene_ubo_data->lightCounts[0] = static_cast<float>(pointLights.size());
-	scene_ubo_data->lightCounts[1] = static_cast<float>(spotLights.size());
-	scene_ubo_data->lightCounts[2] = exposure;
-	scene_ubo_data->lightCounts[3] = 0.0f;
+	scene_ubo_data->display[0] = exposure;
+	scene_ubo_data->display[1] = 0.0f;
+	scene_ubo_data->display[2] = 0.0f;
+	scene_ubo_data->display[3] = 0.0f;
 	vmaFlushAllocation(ctx.allocator, scene_ubo_memory, 0, sizeof(SceneUniforms));
-
-	// ---- Storage-буфер точечных источников ----
-	GpuPointLight gpuPoints[max_lights];
-	for (size_t i = 0; i < pointLights.size(); ++i) {
-		gpuPoints[i] = {};
-		gpuPoints[i].position[0] = pointLights[i].position[0];
-		gpuPoints[i].position[1] = pointLights[i].position[1];
-		gpuPoints[i].position[2] = pointLights[i].position[2];
-		gpuPoints[i].colorIntensity[0] = pointLights[i].color[0];
-		gpuPoints[i].colorIntensity[1] = pointLights[i].color[1];
-		gpuPoints[i].colorIntensity[2] = pointLights[i].color[2];
-		gpuPoints[i].colorIntensity[3] = pointLights[i].intensity;
-	}
-	if (!pointLights.empty()) {
-		std::memcpy(point_lights_data, gpuPoints, pointLights.size() * sizeof(GpuPointLight));
-		vmaFlushAllocation(ctx.allocator, point_lights_memory, 0,
-		                   pointLights.size() * sizeof(GpuPointLight));
-	}
-
-	// ---- Storage-буфер прожекторных источников ----
-	GpuSpotLight gpuSpots[max_lights];
-	for (size_t i = 0; i < spotLights.size(); ++i) {
-		const Vec3 axis = normalized({spotLights[i].direction[0], spotLights[i].direction[1],
-		                              spotLights[i].direction[2]});
-		gpuSpots[i] = {};
-		gpuSpots[i].position[0] = spotLights[i].position[0];
-		gpuSpots[i].position[1] = spotLights[i].position[1];
-		gpuSpots[i].position[2] = spotLights[i].position[2];
-		gpuSpots[i].direction[0] = axis.x;
-		gpuSpots[i].direction[1] = axis.y;
-		gpuSpots[i].direction[2] = axis.z;
-		gpuSpots[i].colorIntensity[0] = spotLights[i].color[0];
-		gpuSpots[i].colorIntensity[1] = spotLights[i].color[1];
-		gpuSpots[i].colorIntensity[2] = spotLights[i].color[2];
-		gpuSpots[i].colorIntensity[3] = spotLights[i].intensity;
-		gpuSpots[i].angles[0] = std::cos(spotLights[i].innerAngleDegrees * pi / 180.0f);
-		gpuSpots[i].angles[1] = std::cos(spotLights[i].outerAngleDegrees * pi / 180.0f);
-	}
-	if (!spotLights.empty()) {
-		std::memcpy(spot_lights_data, gpuSpots, spotLights.size() * sizeof(GpuSpotLight));
-		vmaFlushAllocation(ctx.allocator, spot_lights_memory, 0,
-		                   spotLights.size() * sizeof(GpuSpotLight));
-	}
 
 	// ---- UBO модели: матрица + материал ----
 	std::memcpy(&model_ubo_data->model, &model, sizeof(Mat4));
@@ -829,10 +622,6 @@ void render(const graphics::internal::FrameData& fd) {
 	model_ubo_data->specularShininess[1] = material.specular[1];
 	model_ubo_data->specularShininess[2] = material.specular[2];
 	model_ubo_data->specularShininess[3] = material.shininess;
-	model_ubo_data->flags[0] = 0.0f; // шахматный пол отключён, обычный материал
-	model_ubo_data->flags[1] = 0.0f;
-	model_ubo_data->flags[2] = 0.0f;
-	model_ubo_data->flags[3] = 0.0f;
 	vmaFlushAllocation(ctx.allocator, model_ubo_memory, 0, sizeof(ModelUniforms));
 
 	// ---- Запись отрисовки ----
@@ -843,10 +632,9 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 	vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-	// Привязываем наборы: сцена с индекса 0, модель с индекса 1.
-	const VkDescriptorSet bind_sets[] = {scene_set, model_set};
+	// Привязываем единый набор: binding 0 — сцена, binding 1 — модель.
 	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                        pipeline_layout, 0, 2, bind_sets, 0, nullptr);
+	                        pipeline_layout, 0, 1, &descriptor_set, 0, nullptr);
 
 	const VkDeviceSize offset = 0;
 	vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertex_buffer, &offset);
